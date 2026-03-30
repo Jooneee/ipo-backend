@@ -30,6 +30,24 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/debug')
+def debug():
+    import requests, urllib3
+    urllib3.disable_warnings()
+    results = {}
+    for url in [
+        'http://www.38.co.kr/html/fund/index.htm?o=k',
+        'https://www.38.co.kr/html/fund/index.htm?o=k',
+    ]:
+        try:
+            r = requests.get(url, timeout=10, verify=False,
+                headers={'User-Agent': 'Mozilla/5.0'})
+            results[url] = {'status': r.status_code, 'length': len(r.text)}
+        except Exception as e:
+            results[url] = {'error': str(e)}
+    return jsonify(results)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
