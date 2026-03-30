@@ -40,7 +40,7 @@ def _fetch(url):
 
 
 def _parse_date(s):
-    """단일 날짜 문자열 → M.D 포맷 (예: '2026.05.11' → '5.11')"""
+    """단일 날짜 문자열 → YYYY.M.D 포맷 (예: '2026.05.11' → '2026.5.11')"""
     s = s.strip().replace('\xa0', '').replace(' ', '')
     if not s or s == '-':
         return ''
@@ -48,27 +48,39 @@ def _parse_date(s):
         if '.' in s:
             parts = s.split('.')
             if len(parts) == 3:          # YYYY.MM.DD
-                return f"{int(parts[1])}.{int(parts[2])}"
-            elif len(parts) == 2:        # MM.DD
+                return f"{int(parts[0])}.{int(parts[1])}.{int(parts[2])}"
+            elif len(parts) == 2:        # MM.DD (연도 없음)
                 return f"{int(parts[0])}.{int(parts[1])}"
         if '/' in s:
             parts = s.split('/')
             if len(parts) == 3:          # YYYY/MM/DD
-                return f"{int(parts[1])}.{int(parts[2])}"
+                return f"{int(parts[0])}.{int(parts[1])}.{int(parts[2])}"
     except (ValueError, IndexError):
         pass
     return ''
 
 
 def _parse_date_range(s):
-    """날짜 범위 → M.D~M.D 포맷 (예: '2026.05.11~05.12' → '5.11~5.12')"""
+    """날짜 범위 → YYYY.M.D~YYYY.M.D 포맷 (예: '2026.05.11~05.12' → '2026.5.11~2026.5.12')"""
     s = s.strip().replace('\xa0', '').replace(' ', '')
     if not s:
         return ''
     if '~' in s:
         parts = s.split('~')
         start = _parse_date(parts[0])
-        end = _parse_date(parts[1]) if len(parts) > 1 else ''
+        if not start:
+            return ''
+        end_raw = parts[1].strip().replace('\xa0', '').replace(' ', '') if len(parts) > 1 else ''
+        # end_raw가 MM.DD 형식(연도 없음)인 경우 start에서 연도 추출
+        end_parts = end_raw.split('.')
+        if len(end_parts) == 2:
+            start_parts = start.split('.')
+            if len(start_parts) == 3:
+                end = f"{start_parts[0]}.{int(end_parts[0])}.{int(end_parts[1])}"
+            else:
+                end = _parse_date(end_raw)
+        else:
+            end = _parse_date(end_raw)
         if start and end:
             return f"{start}~{end}"
         return start
