@@ -7,11 +7,11 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-BASE_URL = 'https://www.38.co.kr'
+BASE_URL = 'http://www.38.co.kr'
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0',
     'Accept-Language': 'ko-KR,ko;q=0.9',
-    'Referer': 'https://www.38.co.kr/',
+    'Referer': 'http://www.38.co.kr/',
 }
 
 _cache = {}
