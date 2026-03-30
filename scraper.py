@@ -2,6 +2,7 @@ import requests
 import re
 import time
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import urllib3
 
@@ -105,68 +106,60 @@ def get_ipo_list():
         if not rows:
             break
 
-        found = 0
+        # 1단계: 목록 파싱
+        raw_items = []
         for row in rows:
             cells = row.find_all('td')
             if len(cells) < 6:
                 continue
-
             link = cells[0].find('a')
             if not link:
                 continue
-
             href = link.get('href', '')
             no_match = re.search(r'no=(\d+)', href)
             if not no_match:
                 continue
-
             no = no_match.group(1)
-            name = link.get_text(strip=True)
-
-            # 완료 여부: font color #333333 이면 완료
             font_tag = link.find('font')
             color = (font_tag.get('color', '') if font_tag else '').upper()
-            is_completed = (color == '#333333')
+            raw_items.append({
+                'no': no,
+                'name': link.get_text(strip=True),
+                'is_completed': (color == '#333333'),
+                'subscription_date': _parse_date_range(cells[1].get_text(strip=True)),
+                'ipo_price': re.sub(r'[^\d,]', '', cells[2].get_text(strip=True)),
+                'target_price': cells[3].get_text(strip=True).strip('-').strip(),
+                'competition': cells[4].get_text(strip=True),
+                'underwriter': cells[5].get_text(strip=True),
+            })
 
-            raw_date = cells[1].get_text(strip=True)
-            subscription_date = _parse_date_range(raw_date)
+        if not raw_items:
+            break
 
-            ipo_price = re.sub(r'[^\d,]', '', cells[2].get_text(strip=True))
-            target_price = cells[3].get_text(strip=True).strip('-').strip()
-            competition = cells[4].get_text(strip=True)
-            underwriter = cells[5].get_text(strip=True)
+        # 2단계: 상세 페이지 병렬 fetch (상장일/환불일)
+        nos = [item['no'] for item in raw_items]
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            detail_map = dict(zip(nos, executor.map(_get_detail_cached, nos)))
 
-            # 상세 페이지에서 상장일/환불일 가져오기
-            detail = _get_detail_cached(no)
-            listing_date = detail.get('listing_date', '')
-            refund_date = detail.get('refund_date', '')
-            amount = detail.get('ipo_amount', '')
+        for item in raw_items:
+            no = item['no']
+            detail = detail_map.get(no, {})
             detail_status = detail.get('status', '')
-
-            if detail_status:
-                status = detail_status
-            elif is_completed:
-                status = '청약완료'
-            else:
-                status = ''
-
+            status = detail_status if detail_status else ('청약완료' if item['is_completed'] else '')
             result.append({
                 'code': no,
                 'status': status,
-                'subscription_date': subscription_date,
-                'name': name,
-                'target_price': target_price,
-                'ipo_price': ipo_price or detail.get('ipo_price', ''),
-                'amount': amount,
-                'refund_date': refund_date,
-                'listing_date': listing_date,
-                'competition': competition or detail.get('competition', ''),
-                'underwriter': underwriter,
+                'subscription_date': item['subscription_date'],
+                'name': item['name'],
+                'target_price': item['target_price'],
+                'ipo_price': item['ipo_price'] or detail.get('ipo_price', ''),
+                'amount': detail.get('ipo_amount', ''),
+                'refund_date': detail.get('refund_date', ''),
+                'listing_date': detail.get('listing_date', ''),
+                'competition': item['competition'] or detail.get('competition', ''),
+                'underwriter': item['underwriter'],
             })
-            found += 1
-
-        if found == 0:
-            break
+        found = len(raw_items)
 
     _set_cache('list', result)
     return result
