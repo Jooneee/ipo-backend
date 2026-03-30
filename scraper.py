@@ -1,19 +1,22 @@
 import requests
-from bs4 import BeautifulSoup
 import re
 import time
 from threading import Lock
+from bs4 import BeautifulSoup
+import urllib3
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BASE_URL = 'https://www.38.co.kr'
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0',
     'Accept-Language': 'ko-KR,ko;q=0.9',
-    'Referer': 'http://ipostock.co.kr/',
+    'Referer': 'https://www.38.co.kr/',
 }
 
-# 단순 메모리 캐시
 _cache = {}
 _cache_lock = Lock()
-CACHE_TTL = 3600  # 1시간
+CACHE_TTL = 3600
 
 
 def _get_cache(key):
@@ -30,9 +33,52 @@ def _set_cache(key, data):
 
 
 def _fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.encoding = 'utf-8'
+    r = requests.get(url, headers=HEADERS, timeout=15, verify=False)
+    r.encoding = 'euc-kr'
     return r
+
+
+def _parse_date(s):
+    """단일 날짜 문자열 → M.D 포맷 (예: '2026.05.11' → '5.11')"""
+    s = s.strip().replace('\xa0', '').replace(' ', '')
+    if not s or s == '-':
+        return ''
+    try:
+        if '.' in s:
+            parts = s.split('.')
+            if len(parts) == 3:          # YYYY.MM.DD
+                return f"{int(parts[1])}.{int(parts[2])}"
+            elif len(parts) == 2:        # MM.DD
+                return f"{int(parts[0])}.{int(parts[1])}"
+        if '/' in s:
+            parts = s.split('/')
+            if len(parts) == 3:          # YYYY/MM/DD
+                return f"{int(parts[1])}.{int(parts[2])}"
+    except (ValueError, IndexError):
+        pass
+    return ''
+
+
+def _parse_date_range(s):
+    """날짜 범위 → M.D~M.D 포맷 (예: '2026.05.11~05.12' → '5.11~5.12')"""
+    s = s.strip().replace('\xa0', '').replace(' ', '')
+    if not s:
+        return ''
+    if '~' in s:
+        parts = s.split('~')
+        start = _parse_date(parts[0])
+        end = _parse_date(parts[1]) if len(parts) > 1 else ''
+        if start and end:
+            return f"{start}~{end}"
+        return start
+    return _parse_date(s)
+
+
+def _get_detail_cached(no):
+    cached = _get_cache(f'detail:{no}')
+    if cached is not None:
+        return cached
+    return get_ipo_detail(no)
 
 
 def get_ipo_list():
@@ -40,128 +86,156 @@ def get_ipo_list():
     if cached:
         return cached
 
-    r = _fetch('http://ipostock.co.kr/sub03/ipo04.asp')
-    soup = BeautifulSoup(r.text, 'html.parser')
+    result = []
 
-    # 중첩 테이블이 없으면서 view_ 링크가 있는 가장 안쪽 테이블 찾기
-    target_table = None
-    for table in soup.find_all('table'):
-        nested = table.find('table')
-        links = table.find_all('a', href=re.compile(r'view_\d+\.asp\?code='))
-        if links and not nested:
-            target_table = table
+    for page in range(1, 6):
+        url = f'{BASE_URL}/html/fund/index.htm?o=k&page={page}'
+        try:
+            r = _fetch(url)
+            soup = BeautifulSoup(r.text, 'html.parser')
+        except Exception:
             break
 
-    if not target_table:
-        return []
+        table = soup.find('table', {'summary': '공모주 청약일정'})
+        if not table:
+            break
 
-    result = []
-    for row in target_table.find_all('tr'):
-        link = row.find('a', href=re.compile(r'view_\d+\.asp\?code='))
-        if not link:
-            continue
+        tbody = table.find('tbody')
+        rows = tbody.find_all('tr') if tbody else table.find_all('tr')[1:]
+        if not rows:
+            break
 
-        href = link['href']
-        m = re.search(r'code=([A-Z0-9]+)', href)
-        if not m:
-            continue
-        code = m.group(1)
+        found = 0
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) < 6:
+                continue
 
-        # view_04 or view_01 구분
-        view_type = 'view_04' if 'view_04' in href else 'view_01'
+            link = cells[0].find('a')
+            if not link:
+                continue
 
-        cells = row.find_all('td')
-        # 전체 셀 텍스트 (빈 것도 포함, 위치 유지)
-        all_texts = [c.get_text(strip=True).replace('\xa0', ' ') for c in cells]
+            href = link.get('href', '')
+            no_match = re.search(r'no=(\d+)', href)
+            if not no_match:
+                continue
 
-        # 데이터 행: 최소 9개 셀
-        if len(all_texts) < 9:
-            continue
+            no = no_match.group(1)
+            name = link.get_text(strip=True)
 
-        # 컬럼 구조: [추천, sub_date_or_status, name, target_price, ipo_price, amount, refund_date, listing_date, competition, underwriter]
-        def g(i): return all_texts[i] if i < len(all_texts) else ''
+            # 완료 여부: font color #333333 이면 완료
+            font_tag = link.find('font')
+            color = (font_tag.get('color', '') if font_tag else '').upper()
+            is_completed = (color == '#333333')
 
-        status = g(1) if any(kw in g(1) for kw in ['공모철회', '환불완료', '상장완료']) else ''
-        sub_date = '' if status else g(1)
+            raw_date = cells[1].get_text(strip=True)
+            subscription_date = _parse_date_range(raw_date)
 
-        result.append({
-            'code': code,
-            'view_type': view_type,
-            'status': status,
-            'subscription_date': sub_date,
-            'name': g(2),
-            'target_price': g(3),
-            'ipo_price': g(4),
-            'amount': g(5),
-            'refund_date': g(6),
-            'listing_date': g(7),
-            'competition': g(8),
-            'underwriter': g(9),
-        })
+            ipo_price = re.sub(r'[^\d,]', '', cells[2].get_text(strip=True))
+            target_price = cells[3].get_text(strip=True).strip('-').strip()
+            competition = cells[4].get_text(strip=True)
+            underwriter = cells[5].get_text(strip=True)
+
+            # 상세 페이지에서 상장일/환불일 가져오기
+            detail = _get_detail_cached(no)
+            listing_date = detail.get('listing_date', '')
+            refund_date = detail.get('refund_date', '')
+            amount = detail.get('ipo_amount', '')
+            detail_status = detail.get('status', '')
+
+            if detail_status:
+                status = detail_status
+            elif is_completed:
+                status = '청약완료'
+            else:
+                status = ''
+
+            result.append({
+                'code': no,
+                'status': status,
+                'subscription_date': subscription_date,
+                'name': name,
+                'target_price': target_price,
+                'ipo_price': ipo_price or detail.get('ipo_price', ''),
+                'amount': amount,
+                'refund_date': refund_date,
+                'listing_date': listing_date,
+                'competition': competition or detail.get('competition', ''),
+                'underwriter': underwriter,
+            })
+            found += 1
+
+        if found == 0:
+            break
 
     _set_cache('list', result)
     return result
 
 
-def get_ipo_detail(code):
-    cached = _get_cache(f'detail:{code}')
-    if cached:
+def get_ipo_detail(no):
+    cached = _get_cache(f'detail:{no}')
+    if cached is not None:
         return cached
 
-    detail = {'code': code}
+    url = f'{BASE_URL}/html/fund/index.htm?o=v&no={no}'
+    try:
+        r = _fetch(url)
+        soup = BeautifulSoup(r.text, 'html.parser')
+    except Exception:
+        result = {}
+        _set_cache(f'detail:{no}', result)
+        return result
 
-    # view_04 먼저 시도, 실패 시 view_01
-    for view in ['view_04', 'view_01']:
-        url = f'http://ipostock.co.kr/view_pg/{view}.asp?code={code}&schk=2'
-        try:
-            r = _fetch(url)
-            if r.status_code == 200 and len(r.text) > 1000:
-                break
-        except Exception:
-            continue
+    detail = {'code': no}
 
-    soup = BeautifulSoup(r.text, 'html.parser')
+    field_map = {
+        '공모청약일': 'subscription_date',
+        '수요예측일': 'demand_forecast_date',
+        '납입일': 'payment_date',
+        '환불일': 'refund_date',
+        '상장일': 'listing_date',
+        '확정공모가': 'ipo_price',
+        '희망공모가': 'target_price',
+        '공모금액': 'ipo_amount',
+        '청약경쟁률': 'competition',
+        '주간사': 'underwriter',
+        '액면가': 'par_value',
+        '업종': 'sector',
+        '진행상황': '_status_raw',
+    }
+    date_fields = {'subscription_date', 'listing_date', 'refund_date', 'payment_date', 'demand_forecast_date'}
+
+    for table in soup.find_all('table'):
+        for row in table.find_all('tr'):
+            cells = row.find_all('td')
+            for i, cell in enumerate(cells):
+                label = cell.get_text(strip=True).replace('\xa0', '')
+                for korean, key in field_map.items():
+                    if korean == label and i + 1 < len(cells) and key not in detail:
+                        val = cells[i + 1].get_text(strip=True).replace('\xa0', '').replace(' ', '')
+                        if val and val != '-':
+                            if key in date_fields:
+                                detail[key] = _parse_date_range(val)
+                            else:
+                                detail[key] = val
+
+    # 진행상황 → status 변환
+    status_raw = detail.pop('_status_raw', '')
+    if '신규상장' in status_raw:
+        detail['status'] = '상장완료'
+    elif '공모철회' in status_raw:
+        detail['status'] = '공모철회'
+    else:
+        detail['status'] = ''
 
     # 종목명
-    for tag in soup.find_all(['h1', 'h2', 'h3', 'strong']):
+    for tag in soup.find_all(['h2', 'h3', 'h4', 'strong']):
         text = tag.get_text(strip=True)
-        if text and not any(kw in text for kw in ['IPOSTOCK', '아이피오', 'IPO']):
+        if text and len(text) < 30 and '38' not in text:
             detail.setdefault('name', text)
             break
 
-    # key-value 방식으로 모든 테이블 스캔
-    field_map = {
-        '공모청약일': 'subscription_date',
-        '상장일': 'listing_date',
-        '환불일': 'refund_date',
-        '납일일': 'payment_date',
-        '수요예측일': 'demand_forecast_date',
-        '(확정)공모가격': 'ipo_price',
-        '(희망)공모가격': 'target_price',
-        '(확정)공모금액': 'ipo_amount',
-        '(희망)공모금액': 'target_amount',
-        '청약경쟁률': 'competition',
-        '청약증거금율': 'deposit_rate',
-        '주간사': 'underwriter',
-        '공모가': 'ipo_price_short',
-        '공모일': 'subscription_date_short',
-        '업종': 'sector',
-        '액면가': 'par_value',
-    }
-
-    for table in soup.find_all('table'):
-        rows = table.find_all('tr')
-        for row in rows:
-            cells = row.find_all('td')
-            for i, cell in enumerate(cells):
-                text = cell.get_text(strip=True)
-                for label, key in field_map.items():
-                    if text == label and i + 1 < len(cells):
-                        val = cells[i + 1].get_text(strip=True)
-                        if val and key not in detail:
-                            detail[key] = val
-
-    # 공모주식수 & 배정비율
+    # 공모주식수 / 배정 비율
     shares_info = {}
     for table in soup.find_all('table'):
         for row in table.find_all('tr'):
@@ -172,10 +246,7 @@ def get_ipo_detail(code):
                 if idx + 2 < len(texts):
                     shares_info['retail_shares'] = texts[idx + 1]
                     shares_info['retail_ratio'] = texts[idx + 2]
-            if '공모주식수' in texts[0] if texts else False:
-                shares_info['total_shares'] = texts[1] if len(texts) > 1 else ''
-
     detail['shares_info'] = shares_info
 
-    _set_cache(f'detail:{code}', detail)
+    _set_cache(f'detail:{no}', detail)
     return detail
