@@ -233,14 +233,45 @@ def get_ipo_detail(no):
     else:
         detail['status'] = ''
 
-    # 종목명
-    for tag in soup.find_all(['h2', 'h3', 'h4', 'strong']):
-        text = tag.get_text(strip=True)
-        if text and len(text) < 30 and '38' not in text:
-            detail.setdefault('name', text)
-            break
+    # IPO 페이지 여부 검증: 핵심 IPO 필드가 하나도 없으면 잘못된 페이지
+    ipo_keys = {'subscription_date', 'listing_date', 'refund_date', 'ipo_price', 'target_price', 'competition'}
+    if not any(k in detail for k in ipo_keys):
+        detail['shares_info'] = {}
+        _set_cache(f'detail:{no}', detail)
+        return detail
 
-    # 공모주식수 / 배정 비율
+    # 종목명: <title> 우선, 없으면 fund 관련 heading에서 추출
+    title_tag = soup.find('title')
+    if title_tag:
+        title_text = title_tag.get_text(strip=True)
+        # 38.co.kr title 형식: "종목명 - ..." 또는 "종목명공모주..."
+        for sep in [' - ', ' | ', '공모주', '(']:
+            if sep in title_text:
+                candidate = title_text.split(sep)[0].strip()
+                if candidate and len(candidate) < 30 and '38' not in candidate:
+                    detail.setdefault('name', candidate)
+                    break
+    if 'name' not in detail:
+        # 폴백: fund 페이지 특화 table에서 종목명 찾기
+        for table in soup.find_all('table'):
+            for row in table.find_all('tr'):
+                cells = row.find_all('td')
+                texts = [c.get_text(strip=True) for c in cells]
+                if '종목명' in texts:
+                    idx = texts.index('종목명')
+                    if idx + 1 < len(texts) and texts[idx + 1]:
+                        detail['name'] = texts[idx + 1]
+                        break
+            if 'name' in detail:
+                break
+    if 'name' not in detail:
+        for tag in soup.find_all(['h2', 'h3', 'h4']):
+            text = tag.get_text(strip=True)
+            if text and len(text) < 30 and '38' not in text and 'EPS' not in text:
+                detail['name'] = text
+                break
+
+    # 공모주식수 / 배정 비율: '일반청약자' 레이블이 있는 테이블에서만 추출
     shares_info = {}
     for table in soup.find_all('table'):
         for row in table.find_all('tr'):
@@ -249,8 +280,14 @@ def get_ipo_detail(no):
             if '일반청약자' in texts:
                 idx = texts.index('일반청약자')
                 if idx + 2 < len(texts):
-                    shares_info['retail_shares'] = texts[idx + 1]
-                    shares_info['retail_ratio'] = texts[idx + 2]
+                    # 숫자 포함된 값만 신뢰
+                    shares_val = texts[idx + 1]
+                    ratio_val = texts[idx + 2]
+                    if any(c.isdigit() for c in shares_val):
+                        shares_info['retail_shares'] = shares_val
+                        shares_info['retail_ratio'] = ratio_val
+        if shares_info:
+            break
     detail['shares_info'] = shares_info
 
     _set_cache(f'detail:{no}', detail)
